@@ -32,6 +32,8 @@
 
 #define ChunkSize 2048
 
+#define PATCH_PATH "../patches/"
+
 enum eAuthCmd
 {
     AUTH_LOGON_CHALLENGE                         = 0x00,
@@ -58,6 +60,12 @@ enum eStatus
 #else
 #pragma pack(push, 1)
 #endif
+
+struct TransferDataPacket
+{
+    uint8 cmd;
+    uint16 chunk_size;
+};
 
 typedef struct AUTH_LOGON_CHALLENGE_C
 {
@@ -145,38 +153,7 @@ typedef struct AuthHandler
 #pragma pack(pop)
 #endif
 
-// Launch a thread to transfer a patch to the client
-class PatcherRunnable: public ACE_Based::Runnable
-{
-public:
-    PatcherRunnable(class AuthSocket*);
-    void run();
-
-private:
-    AuthSocket* mySocket;
-};
-
-typedef struct PATCH_INFO
-{
-    uint8 md5[MD5_DIGEST_LENGTH];
-} PATCH_INFO;
-
-// Caches MD5 hash of client patches present on the server
-class Patcher
-{
-public:
-    typedef std::map<std::string, PATCH_INFO*> Patches;
-    ~Patcher();
-    Patcher();
-    Patches::const_iterator begin() const { return _patches.begin(); }
-    Patches::const_iterator end() const { return _patches.end(); }
-    void LoadPatchMD5(char*);
-    bool GetHash(char * pat, uint8 mymd5[16]);
-
-private:
-    void LoadPatchesInfo();
-    Patches _patches;
-};
+Patcher patcher;
 
 const AuthHandler table[] =
 {
@@ -192,12 +169,9 @@ const AuthHandler table[] =
 
 #define AUTH_TOTAL_COMMANDS 8
 
-// Holds the MD5 hash of client patches present on the server
-Patcher PatchesCache;
-
 // Constructor - set the N and g values for SRP6
 AuthSocket::AuthSocket(RealmSocket& socket) :
-    pPatch(NULL), socket_(socket), _authed(false), _build(0),
+    pPatch(NULL), _patcher(NULL), socket_(socket), _authed(false), _build(0),
     _expversion(0), _accountSecurityLevel(SEC_PLAYER)
 {
     N.SetHexStr("894B645E89E1535BBDAD5B8B290650530801B18EBFBF5E8FAB3C82872A3E9BB7");
@@ -205,7 +179,21 @@ AuthSocket::AuthSocket(RealmSocket& socket) :
 }
 
 // Close patch file descriptor before leaving
-AuthSocket::~AuthSocket(void) {}
+AuthSocket::~AuthSocket(void)
+{
+    if (pPatch)
+    {
+        fclose(pPatch);
+        pPatch = NULL;
+    }
+
+    if (_patcher)
+    {
+        _patcher->stop();
+        delete _patcher;
+        _patcher = NULL;
+    }
+}
 
 // Accept the connection
 void AuthSocket::OnAccept(void)
@@ -346,6 +334,10 @@ bool AuthSocket::_HandleLogonChallenge()
     _expversion = uint8(AuthHelper::IsPostBCAcceptedClientBuild(_build) ? POST_BC_EXP_FLAG : (AuthHelper::IsPreBCAcceptedClientBuild(_build) ? PRE_BC_EXP_FLAG : NO_VALID_EXP_FLAG));
     _os = (const char*)ch->os;
 
+    _localizationName.resize(4);
+    for (int i = 0 ; i < 4 ; ++i)
+        _localizationName[i] = ch->country[3 - i];
+
     if (_os.size() > 4)
         return false;
 
@@ -478,10 +470,10 @@ bool AuthSocket::_HandleLogonChallenge()
                     unk3.SetRand(16 * 8);
 
                     // Fill the response packet with the result
-                    if (AuthHelper::IsAcceptedClientBuild(_build))
-                        pkt << uint8(WOW_SUCCESS);
-                    else
+                    if (!AuthHelper::IsAcceptedClientBuild(_build) && !patcher.PossiblePatching(_build, _localizationName))
                         pkt << uint8(WOW_FAIL_VERSION_INVALID);
+                    else
+                        pkt << uint8(WOW_SUCCESS);
 
                     // B may be calculated < 32B so we force minimal length to 32B
                     pkt.append(B.AsByteArray(32), 32);      // 32 bytes
@@ -515,10 +507,6 @@ bool AuthSocket::_HandleLogonChallenge()
                     uint8 secLevel = fields[5].GetUInt8();
                     _accountSecurityLevel = secLevel <= SEC_ADMINISTRATOR ? AccountTypes(secLevel) : SEC_ADMINISTRATOR;
 
-                    _localizationName.resize(4);
-                    for (int i = 0; i < 4; ++i)
-                        _localizationName[i] = ch->country[4-i-1];
-
                     TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "'%s:%d' [AuthChallenge] account %s is using '%c%c%c%c' locale (%u)", socket().getRemoteAddress().c_str(), socket().getRemotePort(),
                             _login.c_str (), ch->country[3], ch->country[2], ch->country[1], ch->country[0], GetLocaleByName(_localizationName)
                         );
@@ -546,9 +534,8 @@ bool AuthSocket::_HandleLogonProof()
     // If the client has no valid version
     if (_expversion == NO_VALID_EXP_FLAG)
     {
-        // Check if we have the appropriate patch on the disk
-        TC_LOG_DEBUG(LOG_FILTER_NETWORKIO, "Client with invalid version, patching is not implemented");
-        socket().shutdown();
+        if (!patcher.InitPatching(_build, _localizationName, this))
+            socket().shutdown();
         return true;
     }
 
@@ -997,34 +984,41 @@ bool AuthSocket::_HandleRealmList()
     return true;
 }
 
-// Resume patch transfer
+// Resume Patch transfer
 bool AuthSocket::_HandleXferResume()
 {
     TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "Entering _HandleXferResume");
-    // Check packet length and patch existence
-    if (socket().recv_len() < 9 || !pPatch) // FIXME: pPatch is never used
+    if (socket().recv_len() < 9 || !pPatch)
     {
         TC_LOG_ERROR(LOG_FILTER_AUTHSERVER, "Error while resuming patch transfer (wrong packet)");
         return false;
     }
 
-    // Launch a PatcherRunnable thread starting at given patch file offset
     uint64 start;
     socket().recv_skip(1);
     socket().recv((char*)&start, sizeof(start));
+
+    fseek(pPatch, 0, SEEK_END);
+    size_t size = ftell(pPatch);
+
     fseek(pPatch, long(start), 0);
 
-    ACE_Based::Thread u(new PatcherRunnable(this));
+    if (_patcher)
+    {
+        _patcher->stop();
+        delete _patcher;
+    }
+    _patcher = new PatcherRunnable(this, start, size);
+    ACE_Based::Thread u(_patcher);
     return true;
 }
 
-// Cancel patch transfer
+// Cancel transfer
 bool AuthSocket::_HandleXferCancel()
 {
-    TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "Entering _HandleXferCancel");
+    TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "Entering _HandlerXferCancel");
 
-    // Close and delete the socket
-    socket().recv_skip(1);                                         //clear input buffer
+    socket().recv_skip(1);
     socket().shutdown();
 
     return true;
@@ -1035,47 +1029,179 @@ bool AuthSocket::_HandleXferAccept()
 {
     TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "Entering _HandleXferAccept");
 
-    // Check packet length and patch existence
     if (!pPatch)
     {
         TC_LOG_ERROR(LOG_FILTER_AUTHSERVER, "Error while accepting patch transfer (wrong packet)");
         return false;
     }
 
-    // Launch a PatcherRunnable thread, starting at the beginning of the patch file
-    socket().recv_skip(1);                                         // clear input buffer
+    socket().recv_skip(1);
+    fseek(pPatch, 0, SEEK_END);
+    size_t size = ftell(pPatch);
     fseek(pPatch, 0, 0);
 
-    ACE_Based::Thread u(new PatcherRunnable(this));
+    if (_patcher)
+    {
+        _patcher->stop();
+        delete _patcher;
+    }
+    _patcher = new PatcherRunnable(this, 0, size);
+    ACE_Based::Thread u(_patcher);
     return true;
 }
 
-PatcherRunnable::PatcherRunnable(class AuthSocket* as)
+
+PatcherRunnable::PatcherRunnable(class AuthSocket* as, uint64 _pos, uint64 _size)
 {
     mySocket = as;
+    pos = _pos;
+    size = _size;
+    stopped = false;
+}
+
+void PatcherRunnable::stop()
+{
+    stopped = true;
 }
 
 // Send content of patch file to the client
 void PatcherRunnable::run()
 {
+    TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "PatchRunnable::run() : %llu -> %llu", pos, size);
+
+    while (pos < size && !stopped)
+    {
+        uint64 left = size - pos;
+        uint16 send_size = (left > 4096) ? 4096 : left;
+
+        char* to_send = new char[sizeof(TransferDataPacket)+send_size];
+        TransferDataPacket* pckt = (TransferDataPacket* )(to_send);
+
+        pckt->cmd = 0x31;
+        pckt->chunk_size = send_size;
+
+        fread(to_send + sizeof(TransferDataPacket), 1, send_size, mySocket->pPatch);
+
+        mySocket->socket().send(to_send, sizeof(TransferDataPacket) + send_size);
+
+        delete[] to_send;
+
+        pos += send_size;
+        usleep(1000);
+    }
+
+    if (!stopped)
+    {
+        fclose(mySocket->pPatch);
+        mySocket->pPatch = NULL;
+        mySocket->_patcher = NULL;
+    }
+
+    TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "Patcher done.");
+
 }
 
-// Preload MD5 hashes of existing patch files on server
+PATCH_INFO* Patcher::getPatchInfo(int _build, std::string _locale, bool* fallback)
+{
+    PATCH_INFO* patch = NULL;
+    int locale = *((int*)(_locale.c_str()));
+    
+    TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "Client with version %i and locale %s (%x) looking for patch.", _build, _locale.c_str(), locale);
+
+    for (Patches::iterator it = _patches.begin() ; it != _patches.end() ; ++it)
+    {
+        if (it->build == _build && it->locale == 'BGne')
+        {
+            patch = &(*it);
+            *fallback = true;
+        }
+        else if (it->build == _build && it->locale == locale)
+        {
+            patch = &(*it);
+            *fallback = false;
+        }
+    }
+
+    return patch;
+}
+
+bool Patcher::PossiblePatching(int _build, std::string _locale)
+{
+    bool temp;
+    return getPatchInfo(_build, _locale, &temp) != NULL;
+}
+
+bool Patcher::InitPatching(int _build, std::string _locale, AuthSocket* _AuthSocket)
+{
+    bool fallback;
+    PATCH_INFO* p_Patch = getPatchInfo(_build, _locale, &fallback);
+
+    if (p_Patch)
+    {
+        uint8 bytes[2] = {0x01, 0x0a};
+        _AuthSocket->socket().send((char*)&bytes, sizeof(uint8));
+
+        std::stringstream path;
+
+        if (fallback)
+        {
+            path << PATCH_PATH << _build << "-enGB.mpq";
+        }
+        else
+        {
+            path << PATCH_PATH << _build << "-" << _locale << ".mpq";
+        }
+
+        _AuthSocket->pPatch = fopen(path.str().c_str(), "rb");
+        TC_LOG_ERROR(LOG_FILTER_AUTHSERVER, "Patch: %s", path.str().c_str());
+        XFER_INIT packet;
+
+        packet.cmd = XFER_INITIATE;
+
+        packet.fileNameLen = 5;
+
+        packet.fileName[0] = 'P';
+        packet.fileName[1] = 'a';
+        packet.fileName[2] = 't';
+        packet.fileName[3] = 'c';
+        packet.fileName[4] = 'h';
+
+        packet.file_size = p_Patch->filesize;
+
+        memcpy(packet.md5, p_Patch->md5, MD5_DIGEST_LENGTH);
+
+        _AuthSocket->socket().send((char*)&packet, sizeof(packet));
+
+        return true;
+    }
+    else
+    {
+        TC_LOG_ERROR(LOG_FILTER_AUTHSERVER, "Client with version %i and locale %s did not get a patch.", _build, _locale.c_str());
+        return false;
+    }
+}
+
+
 #ifndef _WIN32
 #include <dirent.h>
 #include <errno.h>
+
 void Patcher::LoadPatchesInfo()
 {
-    DIR *dirp;
-    struct dirent *dp;
-    dirp = opendir("./patches/");
+    DIR* dirp;
+    struct dirent* dp;
+    dirp = opendir(PATCH_PATH);
 
     if (!dirp)
+    {
+        TC_LOG_ERROR(LOG_FILTER_AUTHSERVER, "Impossible to open folder %s to search for available patches ! Client patching disabled.", PATCH_PATH);
         return;
+    }
 
     while (dirp)
     {
         errno = 0;
+
         if ((dp = readdir(dirp)) != NULL)
         {
             int l = strlen(dp->d_name);
@@ -1083,8 +1209,8 @@ void Patcher::LoadPatchesInfo()
             if (l < 8)
                 continue;
 
-            if (!memcmp(&dp->d_name[l - 4], ".mpq", 4))
-                LoadPatchMD5(dp->d_name);
+            if (!strcmp(&dp->d_name[l - 4], ".mpq"))
+                LoadPatchMD5(PATCH_PATH, dp->d_name);
         }
         else
         {
@@ -1100,28 +1226,26 @@ void Patcher::LoadPatchesInfo()
     if (dirp)
         closedir(dirp);
 }
-#else
-void Patcher::LoadPatchesInfo()
-{
-    WIN32_FIND_DATA fil;
-    HANDLE hFil = FindFirstFile("./patches/*.mpq", &fil);
-    if (hFil == INVALID_HANDLE_VALUE)
-        return;                                             // no patches were found
-
-    do
-        LoadPatchMD5(fil.cFileName);
-    while (FindNextFile(hFil, &fil));
-}
 #endif
 
-// Calculate and store MD5 hash for a given patch file
-void Patcher::LoadPatchMD5(char *szFileName)
+void Patcher::LoadPatchMD5(const char* szPath, char* szFilename)
 {
-    // Try to open the patch file
-    std::string path = "./patches/";
-    path += szFileName;
+    int build;
+    union
+    {
+        int i;
+        char c[4];
+    } locale;
+
+    if (sscanf(szFilename, "%i-%c%c%c%c.mpq", &build, &locale.c[0], &locale.c[1], &locale.c[2], &locale.c[3]) != 5)
+    {
+        TC_LOG_ERROR(LOG_FILTER_AUTHSERVER, "Patch %s filename unrecognized !", szFilename);
+        return;
+    }
+
+    std::string path = szPath;
+    path += szFilename;
     FILE* pPatch = fopen(path.c_str(), "rb");
-    TC_LOG_DEBUG(LOG_FILTER_NETWORKIO, "Loading patch info from %s\n", path.c_str());
 
     if (!pPatch)
     {
@@ -1129,7 +1253,6 @@ void Patcher::LoadPatchMD5(char *szFileName)
         return;
     }
 
-    // Calculate the MD5 hash
     MD5_CTX ctx;
     MD5_Init(&ctx);
     uint8* buf = new uint8[512 * 1024];
@@ -1140,36 +1263,41 @@ void Patcher::LoadPatchMD5(char *szFileName)
         MD5_Update(&ctx, buf, read);
     }
 
-    delete [] buf;
+    delete[] buf;
+    fseek(pPatch, 0, SEEK_END);
+    size_t size = ftell(pPatch);
     fclose(pPatch);
 
-    // Store the result in the internal patch hash map
-    _patches[path] = new PATCH_INFO;
-    MD5_Final((uint8 *)&_patches[path]->md5, &ctx);
+    PATCH_INFO pi;
+    pi.build = build;
+    pi.locale = locale.i;
+    pi.filesize = uint64(size);
+    pi.filename = szFilename;
+    MD5_Final((uint8*)&pi.md5, &ctx);
+    _patches.push_back(pi);
+    TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "Added patch for %i %c%c%c%c.", build, locale.c[0], locale.c[1], locale.c[2], locale.c[3]);
 }
 
-// Get cached MD5 hash for a given patch file
-bool Patcher::GetHash(char * pat, uint8 mymd5[16])
+bool Patcher::GetHash(char* pat, uint8 myMD5[16])
 {
-    for (Patches::iterator i = _patches.begin(); i != _patches.end(); ++i)
-        if (!stricmp(pat, i->first.c_str()))
+    for (Patches::iterator it = _patches.begin() ; it != _patches.end() ; ++it)
+    {
+        if (!stricmp(pat, it->filename.c_str()))
         {
-            memcpy(mymd5, i->second->md5, 16);
+            memcpy(myMD5, it->md5, 16);
             return true;
         }
-
+    }
     return false;
 }
 
-// Launch the patch hashing mechanism on object creation
-Patcher::Patcher()
+void Patcher::Initialize()
 {
+    TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "Searching for available patches.");
     LoadPatchesInfo();
+    if (_patches.empty())
+        TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "No patches found.");
+    else
+        TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "Patch(es) found, ready to deliver to client.");
 }
 
-// Empty and delete the patch map on termination
-Patcher::~Patcher()
-{
-    for (Patches::iterator i = _patches.begin(); i != _patches.end(); ++i)
-        delete i->second;
-}

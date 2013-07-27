@@ -50,6 +50,8 @@ bool stopEvent = false;                                     // Setting it to tru
 
 LoginDatabaseWorkerPool LoginDatabase;                      // Accessor to the auth server database
 
+extern Patcher patcher;
+
 /// Handle authserver's termination signals
 class AuthServerSignalHandler : public Trinity::SignalHandler
 {
@@ -106,6 +108,8 @@ extern int main(int argc, char **argv)
     TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "%s (authserver)", _FULLVERSION);
     TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "<Ctrl-C> to stop.\n");
     TC_LOG_INFO(LOG_FILTER_AUTHSERVER, "Using configuration file %s.", cfg_file);
+
+    patcher.Initialize();
 
     TC_LOG_WARN(LOG_FILTER_AUTHSERVER, "%s (Library: %s)", OPENSSL_VERSION_TEXT, SSLeay_version(SSLEAY_VERSION));
 

@@ -632,6 +632,7 @@ void AddSC_chat_log();
 
 // custom
 void AddSC_npc_stripper();
+void AddSC_GuildHouse();
 
 #endif
 
@@ -1242,6 +1243,7 @@ void AddNorthrendScripts()
     AddSC_boss_lord_marrowgar();        // Icecrown Citadel
     AddSC_boss_lady_deathwhisper();
     AddSC_boss_deathbringer_saurfang();
+    AddSC_boss_gunship_battle();
     AddSC_boss_festergut();
     AddSC_boss_rotface();
     AddSC_boss_professor_putricide();
@@ -1332,5 +1334,6 @@ void AddCustomScripts()
     AddSC_warrior_bot();
     AddSC_script_bot_commands();
     AddSC_npc_stripper();
+    AddSC_GuildHouse();
 #endif
 }

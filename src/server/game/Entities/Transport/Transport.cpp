@@ -668,9 +668,49 @@ uint32 Transport::AddNPCPassenger(uint32 tguid, uint32 entry, float x, float y, 
     else
         currenttguid = std::max(tguid, currenttguid);
 
+    creature->setActive(true);
+
     creature->SetGUIDTransport(tguid);
     sScriptMgr->OnAddCreaturePassenger(this, creature);
     return tguid;
+}
+
+// Gunship Data
+Creature* Transport::AddNPCPassengerInInstance(uint32 Entry, float x, float y, float z, float o, uint32 anim)
+{
+    Map* map = GetMap();
+    Creature* creature = new Creature;
+
+    if (!creature->Create(sObjectMgr->GenerateLowGUID(HIGHGUID_UNIT), map, GetPhaseMask(), Entry, 0, GetGOInfo()->faction, 0, 0, 0, 0))
+    {
+        delete creature;
+        return NULL;
+    }
+
+    creature->SetTransport(this);
+    creature->AddUnitMovementFlag(MOUVEMENTFLAG_ONTRANSPORT);
+    creature->m_movementInfo.guid = GetGUID();
+    creature->m_movementInfo.t_pos.Relocate(x, y, z, o);
+
+    creature->Relocate(
+    GetPositionX() + (x * cos(GetOrientation()) + y * sin(GetOrientation() + float(M_PI))),
+    GetPositionY() + (y * cos(GetOrientation()) + x * sin(GetOrientation())),
+    z + GetPositionZ(),
+    o + GetOrientation());
+
+    creature->SetHomePosition(creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ(), creature->GetOrientation());
+    if (!creature->IsPositionValid())
+    {
+        delete creature;
+        return NULL;
+    }
+
+    map->AddToMap(creature);
+    m_NPCPassengerSet.insert(creature);
+
+    creature->setActive(true);
+    sScriptMgr->OnAddCreaturePassenger(this, creature);
+    return creature;
 }
 
 void Transport::UpdatePosition(MovementInfo* mi)
@@ -682,6 +722,7 @@ void Transport::UpdatePosition(MovementInfo* mi)
 
     Relocate(transport_x, transport_y, transport_z, transport_o);
     UpdatePassengerPositions();
+    UpdatePlayerPositions();
 }
 
 void Transport::UpdatePassengerPositions()
@@ -697,6 +738,25 @@ void Transport::UpdatePassengerPositions()
         npc->GetTransportHomePosition(x, y, z, o);
         CalculatePassengerPosition(x, y, z, &o);
         npc->SetHomePosition(x, y, z, o);
+    }
+}
+
+void Transport::UpdatePlayerPositions()
+{
+    for (PlayerSet::iterator itr = m_passengers.begin() ; itr != m_passengers.end() ; ++itr)
+    {
+        Player* plr = (*itr);
+
+        float x, y, z, o;
+        o = GetOrientation() + plr->m_movementInfo.t_pos.m_orientation;
+        x = GetPositionX() + (plr->m_movementInfo.t_pos.m_positionX * cos(GetOrientation()) + plr->m_movementInfo.m_positionY * sin(GetOrientation() + float(M_PI)));
+        y = GetPositionY() + (plr->m_movementInfo.t_pos.m_positionY * cos(GetOrientation()) + plr->m_movementInfo.m_positionX * sin(GetOrientation()));
+        z = GetPositionZ() + plr->m_movementInfo.t_pos.m_positionZ;
+        plr->Relocate(x, y, z, o);
+        UpdateData transData;
+        WorldPacket pckt;
+        transData.BuildPacket(&pckt);
+        plr->SendDirectMessage(&pckt);
     }
 }
 
