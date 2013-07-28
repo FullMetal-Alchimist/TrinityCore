@@ -1607,8 +1607,8 @@ class instance_icecrown_citadel : public InstanceMapScript
             uint64 MuradinBronzebeardNotVisualGUID;
             uint64 GbBattleMageGUID;
             uint64 GunShipControllerGUID;
-            uint64 GBMuradinGUID;
-            uint64 GBSaurfangGUID;
+            uint64 MuradinBronzebeardGbGUID;
+            uint64 DeathbringerSaurfangGbGUID;
             uint64 GBSkybreakerGUID;
             uint64 GBOrgimsHammerGUID;
             uint64 SindragosasWardGUID;

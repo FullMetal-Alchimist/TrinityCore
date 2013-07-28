@@ -11,6 +11,7 @@
 set(scripts_STAT_SRCS
   ${scripts_STAT_SRCS}
   Custom/npc_stripper.cpp
+  Custom/guild_housing.cpp
 )
 
 message("  -> Prepared: Custom")
